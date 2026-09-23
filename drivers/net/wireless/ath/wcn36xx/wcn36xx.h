@@ -34,6 +34,9 @@
 #define WCN36XX_AGGR_BUFFER_SIZE 64
 
 extern unsigned int wcn36xx_dbg_mask;
+extern bool wcn36xx_disable_assoc_scan;
+extern bool wcn36xx_tx_ack_race_fix;
+extern bool wcn36xx_bmps_guard;
 
 enum wcn36xx_debug_mask {
 	WCN36XX_DBG_DXE		= 0x00000001,
@@ -129,6 +132,9 @@ struct wcn36xx_vif {
 
 	/* Power management */
 	bool allow_bmps;
+	/* Firmware may reject BMPS on this association.  Keep full power
+	 * until the next association instead of retrying the same request. */
+	bool bmps_failed;
 	enum wcn36xx_power_state pw_state;
 
 	u8 bss_index;
@@ -268,6 +274,8 @@ struct wcn36xx {
 
 	struct sk_buff		*tx_ack_skb;
 	struct timer_list	tx_ack_timer;
+	bool			tx_ack_pending;
+	u32			tx_ack_pending_status;
 
 	/* RF module */
 	unsigned		rf_id;

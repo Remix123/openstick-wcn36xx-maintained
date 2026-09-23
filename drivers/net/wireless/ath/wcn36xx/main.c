@@ -33,6 +33,21 @@ unsigned int wcn36xx_dbg_mask;
 module_param_named(debug_mask, wcn36xx_dbg_mask, uint, 0644);
 MODULE_PARM_DESC(debug_mask, "Debugging mask");
 
+bool wcn36xx_disable_assoc_scan = true;
+module_param_named(disable_assoc_scan, wcn36xx_disable_assoc_scan, bool, 0644);
+MODULE_PARM_DESC(disable_assoc_scan,
+		 "Reject hardware scans while associated");
+
+bool wcn36xx_tx_ack_race_fix = true;
+module_param_named(tx_ack_race_fix, wcn36xx_tx_ack_race_fix, bool, 0644);
+MODULE_PARM_DESC(tx_ack_race_fix,
+		 "Handle firmware TX completion before DXE completion");
+
+bool wcn36xx_bmps_guard = true;
+module_param_named(bmps_guard, wcn36xx_bmps_guard, bool, 0644);
+MODULE_PARM_DESC(bmps_guard,
+		 "Guard WCNSS BMPS entry and stop retries after rejection");
+
 #define CHAN2G(_freq, _idx) { \
 	.band = NL80211_BAND_2GHZ, \
 	.center_freq = (_freq), \
@@ -652,7 +667,18 @@ static int wcn36xx_hw_scan(struct ieee80211_hw *hw,
 			   struct ieee80211_scan_request *hw_req)
 {
 	struct wcn36xx *wcn = hw->priv;
+	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
 	int i;
+
+	/*
+	 * Some WCNSS firmware treats associated off-channel scans as roam
+	 * candidate selection and can switch BSSID even at strong signal.
+	 */
+	if (wcn36xx_disable_assoc_scan && vif_priv->sta_assoc) {
+		wcn36xx_dbg(WCN36XX_DBG_MAC,
+			    "reject hardware scan while associated\n");
+		return -EOPNOTSUPP;
+	}
 
 	if (!get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
 		/* fallback to mac80211 software scan */
@@ -837,6 +863,7 @@ static void wcn36xx_bss_info_changed(struct ieee80211_hw *hw,
 
 		if (!is_zero_ether_addr(bss_conf->bssid)) {
 			vif_priv->is_joining = true;
+			vif_priv->bmps_failed = false;
 			vif_priv->bss_index = WCN36XX_HAL_BSS_INVALID_IDX;
 			wcn36xx_smd_set_link_st(wcn, bss_conf->bssid, vif->addr,
 						WCN36XX_HAL_LINK_PREASSOC_STATE);
@@ -846,6 +873,7 @@ static void wcn36xx_bss_info_changed(struct ieee80211_hw *hw,
 					       bss_conf->bssid, false);
 		} else {
 			vif_priv->is_joining = false;
+			vif_priv->bmps_failed = false;
 			wcn36xx_smd_delete_bss(wcn, vif);
 			wcn36xx_smd_set_link_st(wcn, bss_conf->bssid, vif->addr,
 						WCN36XX_HAL_LINK_IDLE_STATE);
@@ -916,6 +944,7 @@ static void wcn36xx_bss_info_changed(struct ieee80211_hw *hw,
 				    bss_conf->aid);
 			vif_priv->sta_assoc = false;
 			vif_priv->allow_bmps = false;
+			vif_priv->bmps_failed = false;
 			wcn36xx_smd_set_link_st(wcn,
 						bss_conf->bssid,
 						vif->addr,

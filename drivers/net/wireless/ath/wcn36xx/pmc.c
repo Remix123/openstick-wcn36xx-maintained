@@ -24,7 +24,18 @@ int wcn36xx_pmc_enter_bmps_state(struct wcn36xx *wcn,
 	int ret = 0;
 	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
 
-	if (!vif_priv->allow_bmps)
+	if (!vif_priv->allow_bmps ||
+	    (wcn36xx_bmps_guard && vif_priv->bmps_failed))
+		return -EAGAIN;
+
+	/* The downstream firmware requires a fully-established BSS context.
+	 * Do not send ENTER_BMPS while association/configuration is still in
+	 * flight or before the first beacon supplied valid timing information. */
+	if (wcn36xx_bmps_guard &&
+	    (!vif_priv->sta_assoc || vif_priv->is_joining ||
+	     vif_priv->bss_index == WCN36XX_HAL_BSS_INVALID_IDX ||
+	     !vif->bss_conf.assoc || !vif->bss_conf.beacon_int ||
+	     !vif->bss_conf.dtim_period || !vif->bss_conf.sync_tsf))
 		return -ENOTSUPP;
 
 	ret = wcn36xx_smd_enter_bmps(wcn, vif);
@@ -33,12 +44,14 @@ int wcn36xx_pmc_enter_bmps_state(struct wcn36xx *wcn,
 		vif_priv->pw_state = WCN36XX_BMPS;
 		vif->driver_flags |= IEEE80211_VIF_BEACON_FILTER;
 	} else {
-		/*
-		 * One of the reasons why HW will not enter BMPS is because
-		 * driver is trying to enter bmps before first beacon was
-		 * received just after auth complete
-		 */
-		wcn36xx_err("Can not enter BMPS!\n");
+		/* A rejected request is persistent for this firmware/BSS state.
+		 * Stop retrying it and leave the interface in full power.  The
+		 * next association resets bmps_failed and gets a fresh attempt. */
+		if (wcn36xx_bmps_guard) {
+			vif_priv->bmps_failed = true;
+			wcn36xx_warn("BMPS rejected (err=%d); keeping full power until reassociation\n",
+				     ret);
+		}
 	}
 	return ret;
 }

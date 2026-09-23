@@ -27,6 +27,10 @@
 #include "wcn36xx.h"
 #include "txrx.h"
 
+static void reap_tx_dxes(struct wcn36xx *wcn, struct wcn36xx_dxe_ch *ch);
+static bool wcn36xx_dxe_tx_status_queued(struct wcn36xx *wcn);
+static void wcn36xx_dxe_complete_pending_tx_ack(struct wcn36xx *wcn);
+
 static void wcn36xx_ccu_write_register(struct wcn36xx *wcn, int addr, int data)
 {
 	wcn36xx_dbg(WCN36XX_DBG_DXE,
@@ -334,11 +338,33 @@ void wcn36xx_dxe_tx_ack_ind(struct wcn36xx *wcn, u32 status)
 	spin_lock_irqsave(&wcn->dxe_lock, flags);
 	skb = wcn->tx_ack_skb;
 	wcn->tx_ack_skb = NULL;
+	wcn->tx_ack_pending = false;
 	del_timer(&wcn->tx_ack_timer);
 	spin_unlock_irqrestore(&wcn->dxe_lock, flags);
 
 	if (!skb) {
-		wcn36xx_warn("Spurious TX complete indication\n");
+		if (!wcn36xx_tx_ack_race_fix) {
+			wcn36xx_warn("Spurious TX complete indication\n");
+			return;
+		}
+
+		/* On this firmware the SMD completion can beat the DXE IRQ.  Keep
+		 * the result only when a matching TX-status skb is still in a ring;
+		 * a late completion after the watchdog has reclaimed the skb is not
+		 * allowed to acknowledge a subsequent frame. */
+		if (!wcn36xx_dxe_tx_status_queued(wcn)) {
+			wcn36xx_warn("Spurious TX complete indication\n");
+			return;
+		}
+
+		spin_lock_irqsave(&wcn->dxe_lock, flags);
+		wcn->tx_ack_pending = true;
+		wcn->tx_ack_pending_status = status;
+		spin_unlock_irqrestore(&wcn->dxe_lock, flags);
+
+		reap_tx_dxes(wcn, &wcn->dxe_tx_l_ch);
+		reap_tx_dxes(wcn, &wcn->dxe_tx_h_ch);
+		wcn36xx_dxe_complete_pending_tx_ack(wcn);
 		return;
 	}
 
@@ -350,6 +376,65 @@ void wcn36xx_dxe_tx_ack_ind(struct wcn36xx *wcn, u32 status)
 		info->flags &= ~IEEE80211_TX_STAT_ACK;
 
 	wcn36xx_dbg(WCN36XX_DBG_DXE, "dxe tx ack status: %d\n", status);
+
+	ieee80211_tx_status_irqsafe(wcn->hw, skb);
+	ieee80211_wake_queues(wcn->hw);
+}
+
+static bool wcn36xx_dxe_tx_status_queued(struct wcn36xx *wcn)
+{
+	struct wcn36xx_dxe_ch *channels[] = {
+		&wcn->dxe_tx_l_ch,
+		&wcn->dxe_tx_h_ch,
+	};
+	struct wcn36xx_dxe_ctl *ctl;
+	unsigned long flags;
+	int i;
+	bool found = false;
+
+	for (i = 0; i < ARRAY_SIZE(channels) && !found; i++) {
+		spin_lock_irqsave(&channels[i]->lock, flags);
+		ctl = channels[i]->head_blk_ctl;
+		do {
+			if (ctl->skb &&
+			    (IEEE80211_SKB_CB(ctl->skb)->flags &
+			     IEEE80211_TX_CTL_REQ_TX_STATUS)) {
+				found = true;
+				break;
+			}
+			ctl = ctl->next;
+		} while (ctl != channels[i]->head_blk_ctl);
+		spin_unlock_irqrestore(&channels[i]->lock, flags);
+	}
+
+	return found;
+}
+
+static void wcn36xx_dxe_complete_pending_tx_ack(struct wcn36xx *wcn)
+{
+	struct ieee80211_tx_info *info;
+	struct sk_buff *skb = NULL;
+	unsigned long flags;
+	u32 status = 0;
+
+	spin_lock_irqsave(&wcn->dxe_lock, flags);
+	if (wcn->tx_ack_pending && wcn->tx_ack_skb) {
+		skb = wcn->tx_ack_skb;
+		wcn->tx_ack_skb = NULL;
+		wcn->tx_ack_pending = false;
+		status = wcn->tx_ack_pending_status;
+		del_timer(&wcn->tx_ack_timer);
+	}
+	spin_unlock_irqrestore(&wcn->dxe_lock, flags);
+
+	if (!skb)
+		return;
+
+	info = IEEE80211_SKB_CB(skb);
+	if (status == 1)
+		info->flags |= IEEE80211_TX_STAT_ACK;
+	else
+		info->flags &= ~IEEE80211_TX_STAT_ACK;
 
 	ieee80211_tx_status_irqsafe(wcn->hw, skb);
 	ieee80211_wake_queues(wcn->hw);
@@ -403,8 +488,26 @@ static void reap_tx_dxes(struct wcn36xx *wcn, struct wcn36xx_dxe_ch *ch)
 			dma_unmap_single(wcn->dev, ctl->desc->src_addr_l,
 					 ctl->skb->len, DMA_TO_DEVICE);
 			info = IEEE80211_SKB_CB(ctl->skb);
-			if (!(info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS)) {
-				/* Keep frame until TX status comes */
+			if (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) {
+				if (!wcn36xx_tx_ack_race_fix) {
+					/* Legacy mode retains the frame for the early SMD
+					 * completion path in wcn36xx_start_tx(). */
+				} else if (info->flags & IEEE80211_TX_CTL_NO_ACK) {
+					info->flags |= IEEE80211_TX_STAT_NOACK_TRANSMITTED;
+					ieee80211_tx_status_irqsafe(wcn->hw, ctl->skb);
+				} else {
+					/* The firmware can emit the TX ack only after the
+					 * DXE descriptor has completed.  Track the skb here,
+					 * not when it is merely queued. */
+					spin_lock(&wcn->dxe_lock);
+					if (wcn->tx_ack_skb)
+						ieee80211_free_txskb(wcn->hw,
+								    wcn->tx_ack_skb);
+					wcn->tx_ack_skb = ctl->skb;
+					mod_timer(&wcn->tx_ack_timer, jiffies + HZ / 10);
+					spin_unlock(&wcn->dxe_lock);
+				}
+			} else {
 				ieee80211_free_txskb(wcn->hw, ctl->skb);
 			}
 
@@ -420,6 +523,7 @@ static void reap_tx_dxes(struct wcn36xx *wcn, struct wcn36xx_dxe_ch *ch)
 
 	ch->tail_blk_ctl = ctl;
 	spin_unlock_irqrestore(&ch->lock, flags);
+	wcn36xx_dxe_complete_pending_tx_ack(wcn);
 }
 
 static irqreturn_t wcn36xx_irq_tx_complete(int irq, void *dev)
@@ -613,6 +717,10 @@ static int wcn36xx_rx_handle_packets(struct wcn36xx *wcn,
 	dxe = ctl->desc;
 
 	while (!(READ_ONCE(dxe->ctrl) & WCN36xx_DXE_CTRL_VLD)) {
+		/* do not read until we own DMA descriptor */
+		dma_rmb();
+
+		/* read/modify DMA descriptor */
 		skb = ctl->skb;
 		dma_addr = dxe->dst_addr_l;
 		ret = wcn36xx_dxe_fill_skb(wcn->dev, ctl, GFP_ATOMIC);
@@ -623,9 +731,15 @@ static int wcn36xx_rx_handle_packets(struct wcn36xx *wcn,
 			dma_unmap_single(wcn->dev, dma_addr, WCN36XX_PKT_SIZE,
 					DMA_FROM_DEVICE);
 			wcn36xx_rx_skb(wcn, skb);
-		} /* else keep old skb not submitted and use it for rx DMA */
+		}
+		/* else keep old skb not submitted and reuse it for rx DMA
+		 * (dropping the packet that it contained)
+		 */
 
+		/* flush descriptor changes before re-marking as valid */
+		dma_wmb();
 		dxe->ctrl = ctrl;
+
 		ctl = ctl->next;
 		dxe = ctl->desc;
 	}
