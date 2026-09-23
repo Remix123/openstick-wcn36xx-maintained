@@ -1,0 +1,360 @@
+From 68b75343081a7f8268ca2255b4347146efa4c34d Mon Sep 17 00:00:00 2001
+From: Remix123 <“aimaomao.daixu@gmail.com”>
+Date: Wed, 23 Sep 2026 16:36:53 +0800
+Subject: [PATCH] wcn36xx backport TX completion and BMPS guards
+
+---
+ drivers/net/wireless/ath/wcn36xx/dxe.c     | 102 ++++++++++++++++++++-
+ drivers/net/wireless/ath/wcn36xx/main.c    |   3 +
+ drivers/net/wireless/ath/wcn36xx/pmc.c     |  24 +++--
+ drivers/net/wireless/ath/wcn36xx/txrx.c    |  47 +++-------
+ drivers/net/wireless/ath/wcn36xx/wcn36xx.h |   5 +
+ 5 files changed, 137 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/wcn36xx/dxe.c b/drivers/net/wireless/ath/wcn36xx/dxe.c
+index 8e1dbfd..435fbe7 100644
+--- a/drivers/net/wireless/ath/wcn36xx/dxe.c
++++ b/drivers/net/wireless/ath/wcn36xx/dxe.c
+@@ -27,6 +27,10 @@
+ #include "wcn36xx.h"
+ #include "txrx.h"
+ 
++static void reap_tx_dxes(struct wcn36xx *wcn, struct wcn36xx_dxe_ch *ch);
++static bool wcn36xx_dxe_tx_status_queued(struct wcn36xx *wcn);
++static void wcn36xx_dxe_complete_pending_tx_ack(struct wcn36xx *wcn);
++
+ static void wcn36xx_ccu_write_register(struct wcn36xx *wcn, int addr, int data)
+ {
+ 	wcn36xx_dbg(WCN36XX_DBG_DXE,
+@@ -334,11 +338,28 @@ void wcn36xx_dxe_tx_ack_ind(struct wcn36xx *wcn, u32 status)
+ 	spin_lock_irqsave(&wcn->dxe_lock, flags);
+ 	skb = wcn->tx_ack_skb;
+ 	wcn->tx_ack_skb = NULL;
++	wcn->tx_ack_pending = false;
+ 	del_timer(&wcn->tx_ack_timer);
+ 	spin_unlock_irqrestore(&wcn->dxe_lock, flags);
+ 
+ 	if (!skb) {
+-		wcn36xx_warn("Spurious TX complete indication\n");
++		/* On this firmware the SMD completion can beat the DXE IRQ.  Keep
++		 * the result only when a matching TX-status skb is still in a ring;
++		 * a late completion after the watchdog has reclaimed the skb is not
++		 * allowed to acknowledge a subsequent frame. */
++		if (!wcn36xx_dxe_tx_status_queued(wcn)) {
++			wcn36xx_warn("Spurious TX complete indication\n");
++			return;
++		}
++
++		spin_lock_irqsave(&wcn->dxe_lock, flags);
++		wcn->tx_ack_pending = true;
++		wcn->tx_ack_pending_status = status;
++		spin_unlock_irqrestore(&wcn->dxe_lock, flags);
++
++		reap_tx_dxes(wcn, &wcn->dxe_tx_l_ch);
++		reap_tx_dxes(wcn, &wcn->dxe_tx_h_ch);
++		wcn36xx_dxe_complete_pending_tx_ack(wcn);
+ 		return;
+ 	}
+ 
+@@ -355,6 +376,65 @@ void wcn36xx_dxe_tx_ack_ind(struct wcn36xx *wcn, u32 status)
+ 	ieee80211_wake_queues(wcn->hw);
+ }
+ 
++static bool wcn36xx_dxe_tx_status_queued(struct wcn36xx *wcn)
++{
++	struct wcn36xx_dxe_ch *channels[] = {
++		&wcn->dxe_tx_l_ch,
++		&wcn->dxe_tx_h_ch,
++	};
++	struct wcn36xx_dxe_ctl *ctl;
++	unsigned long flags;
++	int i;
++	bool found = false;
++
++	for (i = 0; i < ARRAY_SIZE(channels) && !found; i++) {
++		spin_lock_irqsave(&channels[i]->lock, flags);
++		ctl = channels[i]->head_blk_ctl;
++		do {
++			if (ctl->skb &&
++			    (IEEE80211_SKB_CB(ctl->skb)->flags &
++			     IEEE80211_TX_CTL_REQ_TX_STATUS)) {
++				found = true;
++				break;
++			}
++			ctl = ctl->next;
++		} while (ctl != channels[i]->head_blk_ctl);
++		spin_unlock_irqrestore(&channels[i]->lock, flags);
++	}
++
++	return found;
++}
++
++static void wcn36xx_dxe_complete_pending_tx_ack(struct wcn36xx *wcn)
++{
++	struct ieee80211_tx_info *info;
++	struct sk_buff *skb = NULL;
++	unsigned long flags;
++	u32 status = 0;
++
++	spin_lock_irqsave(&wcn->dxe_lock, flags);
++	if (wcn->tx_ack_pending && wcn->tx_ack_skb) {
++		skb = wcn->tx_ack_skb;
++		wcn->tx_ack_skb = NULL;
++		wcn->tx_ack_pending = false;
++		status = wcn->tx_ack_pending_status;
++		del_timer(&wcn->tx_ack_timer);
++	}
++	spin_unlock_irqrestore(&wcn->dxe_lock, flags);
++
++	if (!skb)
++		return;
++
++	info = IEEE80211_SKB_CB(skb);
++	if (status == 1)
++		info->flags |= IEEE80211_TX_STAT_ACK;
++	else
++		info->flags &= ~IEEE80211_TX_STAT_ACK;
++
++	ieee80211_tx_status_irqsafe(wcn->hw, skb);
++	ieee80211_wake_queues(wcn->hw);
++}
++
+ static void wcn36xx_dxe_tx_timer(struct timer_list *t)
+ {
+ 	struct wcn36xx *wcn = from_timer(wcn, t, tx_ack_timer);
+@@ -403,8 +483,23 @@ static void reap_tx_dxes(struct wcn36xx *wcn, struct wcn36xx_dxe_ch *ch)
+ 			dma_unmap_single(wcn->dev, ctl->desc->src_addr_l,
+ 					 ctl->skb->len, DMA_TO_DEVICE);
+ 			info = IEEE80211_SKB_CB(ctl->skb);
+-			if (!(info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS)) {
+-				/* Keep frame until TX status comes */
++			if (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) {
++				if (info->flags & IEEE80211_TX_CTL_NO_ACK) {
++					info->flags |= IEEE80211_TX_STAT_NOACK_TRANSMITTED;
++					ieee80211_tx_status_irqsafe(wcn->hw, ctl->skb);
++				} else {
++					/* The firmware can emit the TX ack only after the
++					 * DXE descriptor has completed.  Track the skb here,
++					 * not when it is merely queued. */
++					spin_lock(&wcn->dxe_lock);
++					if (wcn->tx_ack_skb)
++						ieee80211_free_txskb(wcn->hw,
++								    wcn->tx_ack_skb);
++					wcn->tx_ack_skb = ctl->skb;
++					mod_timer(&wcn->tx_ack_timer, jiffies + HZ / 10);
++					spin_unlock(&wcn->dxe_lock);
++				}
++			} else {
+ 				ieee80211_free_txskb(wcn->hw, ctl->skb);
+ 			}
+ 
+@@ -420,6 +515,7 @@ static void reap_tx_dxes(struct wcn36xx *wcn, struct wcn36xx_dxe_ch *ch)
+ 
+ 	ch->tail_blk_ctl = ctl;
+ 	spin_unlock_irqrestore(&ch->lock, flags);
++	wcn36xx_dxe_complete_pending_tx_ack(wcn);
+ }
+ 
+ static irqreturn_t wcn36xx_irq_tx_complete(int irq, void *dev)
+diff --git a/drivers/net/wireless/ath/wcn36xx/main.c b/drivers/net/wireless/ath/wcn36xx/main.c
+index d18effa..a1e3115 100644
+--- a/drivers/net/wireless/ath/wcn36xx/main.c
++++ b/drivers/net/wireless/ath/wcn36xx/main.c
+@@ -837,6 +837,7 @@ static void wcn36xx_bss_info_changed(struct ieee80211_hw *hw,
+ 
+ 		if (!is_zero_ether_addr(bss_conf->bssid)) {
+ 			vif_priv->is_joining = true;
++			vif_priv->bmps_failed = false;
+ 			vif_priv->bss_index = WCN36XX_HAL_BSS_INVALID_IDX;
+ 			wcn36xx_smd_set_link_st(wcn, bss_conf->bssid, vif->addr,
+ 						WCN36XX_HAL_LINK_PREASSOC_STATE);
+@@ -846,6 +847,7 @@ static void wcn36xx_bss_info_changed(struct ieee80211_hw *hw,
+ 					       bss_conf->bssid, false);
+ 		} else {
+ 			vif_priv->is_joining = false;
++			vif_priv->bmps_failed = false;
+ 			wcn36xx_smd_delete_bss(wcn, vif);
+ 			wcn36xx_smd_set_link_st(wcn, bss_conf->bssid, vif->addr,
+ 						WCN36XX_HAL_LINK_IDLE_STATE);
+@@ -916,6 +918,7 @@ static void wcn36xx_bss_info_changed(struct ieee80211_hw *hw,
+ 				    bss_conf->aid);
+ 			vif_priv->sta_assoc = false;
+ 			vif_priv->allow_bmps = false;
++			vif_priv->bmps_failed = false;
+ 			wcn36xx_smd_set_link_st(wcn,
+ 						bss_conf->bssid,
+ 						vif->addr,
+diff --git a/drivers/net/wireless/ath/wcn36xx/pmc.c b/drivers/net/wireless/ath/wcn36xx/pmc.c
+index 2d0780f..3dd01b3 100644
+--- a/drivers/net/wireless/ath/wcn36xx/pmc.c
++++ b/drivers/net/wireless/ath/wcn36xx/pmc.c
+@@ -24,7 +24,16 @@ int wcn36xx_pmc_enter_bmps_state(struct wcn36xx *wcn,
+ 	int ret = 0;
+ 	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
+ 
+-	if (!vif_priv->allow_bmps)
++	if (!vif_priv->allow_bmps || vif_priv->bmps_failed)
++		return -EAGAIN;
++
++	/* The downstream firmware requires a fully-established BSS context.
++	 * Do not send ENTER_BMPS while association/configuration is still in
++	 * flight or before the first beacon supplied valid timing information. */
++	if (!vif_priv->sta_assoc || vif_priv->is_joining ||
++	    vif_priv->bss_index == WCN36XX_HAL_BSS_INVALID_IDX ||
++	    !vif->bss_conf.assoc || !vif->bss_conf.beacon_int ||
++	    !vif->bss_conf.dtim_period || !vif->bss_conf.sync_tsf)
+ 		return -ENOTSUPP;
+ 
+ 	ret = wcn36xx_smd_enter_bmps(wcn, vif);
+@@ -33,12 +42,13 @@ int wcn36xx_pmc_enter_bmps_state(struct wcn36xx *wcn,
+ 		vif_priv->pw_state = WCN36XX_BMPS;
+ 		vif->driver_flags |= IEEE80211_VIF_BEACON_FILTER;
+ 	} else {
+-		/*
+-		 * One of the reasons why HW will not enter BMPS is because
+-		 * driver is trying to enter bmps before first beacon was
+-		 * received just after auth complete
+-		 */
+-		wcn36xx_err("Can not enter BMPS!\n");
++		/* A rejected request is persistent for this firmware/BSS state.
++		 * Stop retrying it and leave the interface in full power.  The
++		 * next association resets bmps_failed and gets a fresh attempt. */
++		vif_priv->bmps_failed = true;
++		vif_priv->allow_bmps = false;
++		wcn36xx_warn("BMPS rejected (err=%d); keeping full power until reassociation\n",
++			     ret);
+ 	}
+ 	return ret;
+ }
+diff --git a/drivers/net/wireless/ath/wcn36xx/txrx.c b/drivers/net/wireless/ath/wcn36xx/txrx.c
+index cab196b..0a11b6f 100644
+--- a/drivers/net/wireless/ath/wcn36xx/txrx.c
++++ b/drivers/net/wireless/ath/wcn36xx/txrx.c
+@@ -321,8 +321,6 @@ static void wcn36xx_set_tx_pdu(struct wcn36xx_tx_bd *bd,
+ 		bd->pdu.mpdu_header_off;
+ 	bd->pdu.mpdu_len = len;
+ 	bd->pdu.tid = tid;
+-	/* Use seq number generated by mac80211 */
+-	bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_HOST;
+ }
+ 
+ static inline struct wcn36xx_vif *get_vif_by_addr(struct wcn36xx *wcn,
+@@ -419,6 +417,9 @@ static void wcn36xx_set_tx_data(struct wcn36xx_tx_bd *bd,
+ 		tid = ieee80211_get_tid(hdr);
+ 		/* TID->QID is one-to-one mapping */
+ 		bd->queue_id = tid;
++		bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_DPU_QOS;
++	} else {
++		bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_DPU_NON_QOS;
+ 	}
+ 
+ 	if (info->flags & IEEE80211_TX_INTFL_DONT_ENCRYPT ||
+@@ -429,6 +430,9 @@ static void wcn36xx_set_tx_data(struct wcn36xx_tx_bd *bd,
+ 	if (ieee80211_is_any_nullfunc(hdr->frame_control)) {
+ 		/* Don't use a regular queue for null packet (no ampdu) */
+ 		bd->queue_id = WCN36XX_TX_U_WQ_ID;
++		bd->bd_rate = WCN36XX_BD_RATE_CTRL;
++		if (ieee80211_is_qos_nullfunc(hdr->frame_control))
++			bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_HOST;
+ 	}
+ 
+ 	if (bcast) {
+@@ -487,6 +491,7 @@ static void wcn36xx_set_tx_mgmt(struct wcn36xx_tx_bd *bd,
+ 	} else
+ 		bd->queue_id = WCN36XX_TX_U_WQ_ID;
+ 	*vif_priv = __vif_priv;
++	bd->pdu.bd_ssn = WCN36XX_TXBD_SSN_FILL_DPU_NON_QOS;
+ 
+ 	wcn36xx_set_tx_pdu(bd,
+ 			   ieee80211_is_data_qos(hdr->frame_control) ?
+@@ -502,10 +507,11 @@ int wcn36xx_start_tx(struct wcn36xx *wcn,
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+ 	struct wcn36xx_vif *vif_priv = NULL;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+-	unsigned long flags;
+ 	bool is_low = ieee80211_is_data(hdr->frame_control);
+ 	bool bcast = is_broadcast_ether_addr(hdr->addr1) ||
+ 		is_multicast_ether_addr(hdr->addr1);
++	bool ack_ind = (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) &&
++				!(info->flags & IEEE80211_TX_CTL_NO_ACK);
+ 	struct wcn36xx_tx_bd bd;
+ 	int ret;
+ 
+@@ -521,30 +527,12 @@ int wcn36xx_start_tx(struct wcn36xx *wcn,
+ 
+ 	bd.dpu_rf = WCN36XX_BMU_WQ_TX;
+ 
+-	if (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) {
++	if (unlikely(ack_ind)) {
+ 		wcn36xx_dbg(WCN36XX_DBG_DXE, "TX_ACK status requested\n");
+ 
+-		spin_lock_irqsave(&wcn->dxe_lock, flags);
+-		if (wcn->tx_ack_skb) {
+-			spin_unlock_irqrestore(&wcn->dxe_lock, flags);
+-			wcn36xx_warn("tx_ack_skb already set\n");
+-			return -EINVAL;
+-		}
+-
+-		wcn->tx_ack_skb = skb;
+-		spin_unlock_irqrestore(&wcn->dxe_lock, flags);
+-
+-		/* Only one at a time is supported by fw. Stop the TX queues
+-		 * until the ack status gets back.
+-		 */
++		/* Only one at a time is supported by firmware. */
+ 		ieee80211_stop_queues(wcn->hw);
+-
+-		/* TX watchdog if no TX irq or ack indication received  */
+-		mod_timer(&wcn->tx_ack_timer, jiffies + HZ / 10);
+-
+-		/* Request ack indication from the firmware */
+-		if (!(info->flags & IEEE80211_TX_CTL_NO_ACK))
+-			bd.tx_comp = 1;
++		bd.tx_comp = 1;
+ 	}
+ 
+ 	/* Data frames served first*/
+@@ -558,16 +546,7 @@ int wcn36xx_start_tx(struct wcn36xx *wcn,
+ 	bd.tx_bd_sign = 0xbdbdbdbd;
+ 
+ 	ret = wcn36xx_dxe_tx_frame(wcn, vif_priv, &bd, skb, is_low);
+-	if (ret && (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS)) {
+-		/* If the skb has not been transmitted,
+-		 * don't keep a reference to it.
+-		 */
+-		spin_lock_irqsave(&wcn->dxe_lock, flags);
+-		wcn->tx_ack_skb = NULL;
+-		spin_unlock_irqrestore(&wcn->dxe_lock, flags);
+-
++	if (unlikely(ret && ack_ind))
+ 		ieee80211_wake_queues(wcn->hw);
+-	}
+-
+ 	return ret;
+ }
+diff --git a/drivers/net/wireless/ath/wcn36xx/wcn36xx.h b/drivers/net/wireless/ath/wcn36xx/wcn36xx.h
+index add6e52..7628e8d 100644
+--- a/drivers/net/wireless/ath/wcn36xx/wcn36xx.h
++++ b/drivers/net/wireless/ath/wcn36xx/wcn36xx.h
+@@ -129,6 +129,9 @@ struct wcn36xx_vif {
+ 
+ 	/* Power management */
+ 	bool allow_bmps;
++	/* Firmware may reject BMPS on this association.  Keep full power
++	 * until the next association instead of retrying the same request. */
++	bool bmps_failed;
+ 	enum wcn36xx_power_state pw_state;
+ 
+ 	u8 bss_index;
+@@ -268,6 +271,8 @@ struct wcn36xx {
+ 
+ 	struct sk_buff		*tx_ack_skb;
+ 	struct timer_list	tx_ack_timer;
++	bool			tx_ack_pending;
++	u32			tx_ack_pending_status;
+ 
+ 	/* RF module */
+ 	unsigned		rf_id;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,13 @@
+#!/bin/sh
+[ "${1:-}" = wlan0 ] || exit 0
+[ "${2:-}" = up ] || exit 0
+[ -r /etc/default/wcn36xx-fixes ] && . /etc/default/wcn36xx-fixes
+[ "${DISABLE_BGSCAN:-1}" = 1 ] || exit 0
+i=0
+while [ "$i" -lt 10 ]; do
+	ids=$(wpa_cli -i wlan0 list_networks 2>/dev/null | awk 'NR > 1 && $1 ~ /^[0-9]+$/ { print $1 }')
+	[ -n "$ids" ] && break
+	i=$((i + 1)); sleep 1
+done
+for id in $ids; do wpa_cli -i wlan0 set_network "$id" bgscan '""' >/dev/null 2>&1 || true; done
+exit 0

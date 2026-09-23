@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+PARAM_DIR=/sys/module/wcn36xx/parameters
+MODPROBE_CONF=/etc/modprobe.d/wcn36xx-fixes.conf
+DEFAULTS=/etc/default/wcn36xx-fixes
+IFACE=${WCN36XX_IFACE:-wlan0}
+die() { echo "wcn36xx-fixes: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die 'run as root'; }
+valid_bool() { [ "$2" = on ] || [ "$2" = off ] || die "usage: wcn36xx-fixes $1 on|off"; }
+boolval() { [ "$1" = on ] && echo 1 || echo 0; }
+persist() {
+	install -d -m 0755 /etc/modprobe.d /etc/default
+	{
+		echo '# Managed by wcn36xx-fixes; changes apply on next module load.'
+		echo "options wcn36xx disable_assoc_scan=$(boolval "$SCAN") tx_ack_race_fix=$(boolval "$TXACK") bmps_guard=$(boolval "$BMPS")"
+	} > "$MODPROBE_CONF"
+	{
+		echo '# Managed by wcn36xx-fixes.'
+		[ "$SCAN" = on ] && echo 'DISABLE_BGSCAN=1' || echo 'DISABLE_BGSCAN=0'
+	} > "$DEFAULTS"
+}
+read_current() {
+	[ -r "$PARAM_DIR/disable_assoc_scan" ] || die 'wcn36xx module is not loaded or lacks the fix parameters'
+	SCAN=off; [ "$(cat "$PARAM_DIR/disable_assoc_scan")" = Y ] && SCAN=on
+	TXACK=off; [ "$(cat "$PARAM_DIR/tx_ack_race_fix")" = Y ] && TXACK=on
+	BMPS=off; [ "$(cat "$PARAM_DIR/bmps_guard")" = Y ] && BMPS=on
+}
+set_param() {
+	name=$1 value=$2 path="$PARAM_DIR/$1"
+	[ -w "$path" ] || die "parameter is not writable: $path"
+	echo "$(boolval "$value")" > "$path"
+}
+bgscan() {
+	command -v wpa_cli >/dev/null 2>&1 || die 'wpa_cli not found'
+	ids=$(wpa_cli -i "$IFACE" list_networks 2>/dev/null | awk 'NR > 1 && $1 ~ /^[0-9]+$/ { print $1 }')
+	[ -n "$ids" ] || return 0
+	for id in $ids; do
+		if [ "$1" = on ]; then
+			wpa_cli -i "$IFACE" set_network "$id" bgscan '"simple:30:-65:300"' >/dev/null
+		else
+			wpa_cli -i "$IFACE" set_network "$id" bgscan '""' >/dev/null
+		fi
+	done
+}
+usage() { echo 'usage: wcn36xx-fixes {status|scan on|off|tx-ack on|off|bmps-guard on|off}'; }
+[ "$#" -ge 1 ] || { usage >&2; exit 2; }
+need_root
+read_current
+case "$1" in
+status)
+	printf 'associated-scan-guard=%s\nTX-completion-fix=%s\nBMPS-guard=%s\n' "$SCAN" "$TXACK" "$BMPS"
+	[ ! -r "$DEFAULTS" ] || . "$DEFAULTS"
+	printf 'persistent-bgscan-disable=%s\n' "${DISABLE_BGSCAN:-unset}"
+	exit 0
+	;;
+scan)
+	[ "$#" -eq 2 ] || { usage >&2; exit 2; }; valid_bool scan "$2"
+	SCAN=$2; set_param disable_assoc_scan "$SCAN"; bgscan "$SCAN"; persist
+	;;
+tx-ack)
+	[ "$#" -eq 2 ] || { usage >&2; exit 2; }; valid_bool tx-ack "$2"
+	state=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n 's/^wpa_state=//p' | head -n 1 || true)
+	[ "$state" = DISCONNECTED ] || die "disconnect $IFACE first (wpa_state=${state:-unknown}); changing TX completion mode while traffic is active is unsafe"
+	TXACK=$2; set_param tx_ack_race_fix "$TXACK"; persist
+	;;
+bmps-guard)
+	[ "$#" -eq 2 ] || { usage >&2; exit 2; }; valid_bool bmps-guard "$2"
+	BMPS=$2; set_param bmps_guard "$BMPS"; persist
+	;;
+*) usage >&2; exit 2 ;;
+esac
+echo 'updated live module setting and persistent defaults'
